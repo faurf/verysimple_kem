@@ -4,23 +4,24 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/md5"
-	"crypto/sha256"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
-	"hash/fnv"
+	mr "math/rand"
+
 	"io"
-	"math/rand"
 	"net"
 	"net/url"
 	"runtime"
 	"strings"
-	"time"
 
+	"github.com/cloudflare/circl/kem/kyber/kyber512"
 	"github.com/e1732a364fed/v2ray_simple/netLayer"
 	"github.com/e1732a364fed/v2ray_simple/proxy"
 	"github.com/e1732a364fed/v2ray_simple/utils"
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/sha3"
 )
 
 const systemAutoWillUseAes = runtime.GOARCH == "amd64" || runtime.GOARCH == "s390x" || runtime.GOARCH == "arm64"
@@ -32,25 +33,7 @@ func init() {
 type ClientCreator struct{}
 
 func (ClientCreator) NewClientFromURL(url *url.URL) (proxy.Client, error) {
-	uuidStr := url.User.Username()
-	uuid, err := utils.StrToUUID(uuidStr)
-	if err != nil {
-		return nil, err
-	}
-
-	query := url.Query()
-
-	security := query.Get("security")
-
-	c := &Client{}
-	c.V2rayUser = utils.V2rayUser(uuid)
-
-	c.opt = OptChunkStream
-	if err = c.specifySecurityByStr(security); err != nil {
-		return nil, err
-	}
-
-	return c, nil
+	return nil, errors.New("public key too long to be put into url")
 }
 
 func (ClientCreator) NewClient(dc *proxy.DialConf) (proxy.Client, error) {
@@ -78,6 +61,15 @@ func (ClientCreator) NewClient(dc *proxy.DialConf) (proxy.Client, error) {
 
 			}
 		}
+		if thing := dc.Extra["server_publickey"]; thing != nil {
+			if str, ok := thing.(string); ok {
+				ds, err := hex.DecodeString(str)
+				if err != nil {
+					return nil, err
+				}
+				c.srvpub.Unpack(ds)
+			}
+		}
 	}
 
 	if !hasSetSecurityByExtra {
@@ -91,6 +83,7 @@ type Client struct {
 	proxy.Base
 	utils.V2rayUser
 
+	srvpub   kyber512.PublicKey
 	opt      byte
 	security byte
 }
@@ -98,13 +91,13 @@ type Client struct {
 func (c *Client) specifySecurityByStr(security string) error {
 	security = strings.ToLower(security)
 	switch security {
-	case "aes-128-gcm":
-		c.security = SecurityAES128GCM
+	case "aes-256-gcm":
+		c.security = SecurityAES256GCM
 	case "chacha20-poly1305":
 		c.security = SecurityChacha20Poly1305
 	case "auto":
 		if systemAutoWillUseAes {
-			c.security = SecurityAES128GCM
+			c.security = SecurityAES256GCM
 		} else {
 			c.security = SecurityChacha20Poly1305
 
@@ -125,7 +118,6 @@ func (c *Client) specifySecurityByStr(security string) error {
 func (c *Client) Name() string { return Name }
 
 func (c *Client) Handshake(underlay net.Conn, firstPayload []byte, target netLayer.Addr) (io.ReadWriteCloser, error) {
-
 	return c.commonHandshake(underlay, firstPayload, target)
 }
 
@@ -140,23 +132,12 @@ func (c *Client) commonHandshake(underlay net.Conn, firstPayload []byte, target 
 		V2rayUser: c.V2rayUser,
 		Conn:      underlay,
 		opt:       c.opt,
-		security:  c.security,
 		port:      uint16(target.Port),
+		pub:       c.srvpub,
+		security:  c.security,
 	}
 
 	conn.addr, conn.atyp = target.AddressBytes()
-
-	randBytes := utils.GetBytes(33)
-	rand.Read(randBytes)
-	copy(conn.reqBodyIV[:], randBytes[:16])
-	copy(conn.reqBodyKey[:], randBytes[16:32])
-	conn.reqRespV = randBytes[32]
-	utils.PutBytes(randBytes)
-
-	bodyKey := sha256.Sum256(conn.reqBodyKey[:])
-	bodyIV := sha256.Sum256(conn.reqBodyIV[:])
-	copy(conn.respBodyKey[:], bodyKey[:16])
-	copy(conn.respBodyIV[:], bodyIV[:16])
 
 	var err error
 
@@ -191,14 +172,11 @@ type ClientConn struct {
 	addr []byte
 	port uint16
 
-	reqBodyIV   [16]byte
-	reqBodyKey  [16]byte
-	reqRespV    byte
-	respBodyIV  [16]byte
-	respBodyKey [16]byte
+	pub kyber512.PublicKey
 
-	dataReader io.Reader
-	dataWriter io.Writer
+	sharedsecret [kyber512.SharedKeySize]byte
+	dataReader   io.Reader
+	dataWriter   io.Writer
 
 	vmessout []byte
 }
@@ -232,23 +210,30 @@ func (c *ClientConn) WriteMsgTo(b []byte, _ netLayer.Addr) error {
 }
 
 // handshake sends request to server.
+// data:=[Encap 768][AuthID 16][opt 1][sceurity 1][paddinglen 1][cmd 1][port 1BE][atyp 1][addr 1/4/16][padding 0-16]
+// smalldata:=[opt 1][sceurity 1][paddinglen 1][cmd 1][port 1BE][atyp 1][addr 1/4/16][padding 0-16]
+// Seal1(len(smalldata)) Seal2(smalldata)
+
 func (c *ClientConn) handshake(cmd byte, firstpayload []byte) error {
 	buf := utils.GetBuf()
 	defer utils.PutBuf(buf)
 
-	// Request
-	buf.WriteByte(1) // Ver
-	buf.Write(c.reqBodyIV[:])
-	buf.Write(c.reqBodyKey[:])
-	buf.WriteByte(c.reqRespV)
+	//Encapsulataion
+	ciphertext := utils.GetBytes(kyber512.CiphertextSize)
+	defer utils.PutBytes(ciphertext)
+	c.pub.EncapsulateTo(ciphertext, c.sharedsecret[:], nil)
+	buf.Write(ciphertext)
+
+	authid := utils.GetBytes(authid_len)
+	defer utils.PutBytes(authid)
+	kdf(sha3.NewShake256(), c.V2rayUser[:], authid, ciphertext, []byte(kdfSaltConstAEADAuthID), c.V2rayUser[:])
+
+	buf.Write(authid)
 	buf.WriteByte(c.opt)
-
-	// pLen and Sec
-	paddingLen := rand.Intn(16)
-	pSec := byte(paddingLen<<4) | c.security // P(4bit) and Sec(4bit)
-	buf.WriteByte(pSec)
-
-	buf.WriteByte(0) // reserved
+	buf.WriteByte(c.security)
+	// pLen
+	paddingLen := mr.Intn(16)
+	buf.WriteByte(byte(paddingLen))
 	buf.WriteByte(cmd)
 
 	// target
@@ -263,72 +248,22 @@ func (c *ClientConn) handshake(cmd byte, firstpayload []byte) error {
 	// padding
 	if paddingLen > 0 {
 		padding := utils.GetBytes(paddingLen)
-		rand.Read(padding)
+		defer utils.PutBytes(padding)
+		n, err := rand.Read(padding)
+		if err != nil {
+			return err
+		} else if n != paddingLen {
+			return errors.New("failed to pad")
+		}
 		buf.Write(padding)
-		utils.PutBytes(padding)
 	}
 
-	fnv1a := fnv.New32a()
-	_, err = fnv1a.Write(buf.Bytes())
-	if err != nil {
-		return err
-	}
-	buf.Write(fnv1a.Sum(nil))
-
-	c.vmessout = sealAEADHeader(GetKey(c.V2rayUser), buf.Bytes(), time.Now())
+	c.vmessout = sealAEADHeader(c.sharedsecret[:], buf.Bytes())
 
 	_, err = c.Write(firstpayload)
 
 	return err
 
-}
-
-func (vc *ClientConn) aead_decodeRespHeader() error {
-	var buf []byte
-	aeadResponseHeaderLengthEncryptionKey := kdf16(vc.respBodyKey[:], kdfSaltConstAEADRespHeaderLenKey)
-	aeadResponseHeaderLengthEncryptionIV := kdf(vc.respBodyIV[:], kdfSaltConstAEADRespHeaderLenIV)[:12]
-
-	aeadResponseHeaderLengthEncryptionKeyAESBlock, _ := aes.NewCipher(aeadResponseHeaderLengthEncryptionKey)
-	aeadResponseHeaderLengthEncryptionAEAD, _ := cipher.NewGCM(aeadResponseHeaderLengthEncryptionKeyAESBlock)
-
-	aeadEncryptedResponseHeaderLength := make([]byte, 18)
-	if _, err := io.ReadFull(vc.Conn, aeadEncryptedResponseHeaderLength); err != nil {
-		return err
-	}
-
-	decryptedResponseHeaderLengthBinaryBuffer, err := aeadResponseHeaderLengthEncryptionAEAD.Open(nil, aeadResponseHeaderLengthEncryptionIV, aeadEncryptedResponseHeaderLength[:], nil)
-	if err != nil {
-		return err
-	}
-	decryptedResponseHeaderLength := binary.BigEndian.Uint16(decryptedResponseHeaderLengthBinaryBuffer)
-	aeadResponseHeaderPayloadEncryptionKey := kdf(vc.respBodyKey[:], kdfSaltConstAEADRespHeaderPayloadKey)[:16]
-	aeadResponseHeaderPayloadEncryptionIV := kdf(vc.respBodyIV[:], kdfSaltConstAEADRespHeaderPayloadIV)[:12]
-	aeadResponseHeaderPayloadEncryptionKeyAESBlock, _ := aes.NewCipher(aeadResponseHeaderPayloadEncryptionKey)
-	aeadResponseHeaderPayloadEncryptionAEAD, _ := cipher.NewGCM(aeadResponseHeaderPayloadEncryptionKeyAESBlock)
-
-	encryptedResponseHeaderBuffer := make([]byte, decryptedResponseHeaderLength+16)
-	if _, err := io.ReadFull(vc.Conn, encryptedResponseHeaderBuffer); err != nil {
-		return err
-	}
-
-	buf, err = aeadResponseHeaderPayloadEncryptionAEAD.Open(nil, aeadResponseHeaderPayloadEncryptionIV, encryptedResponseHeaderBuffer, nil)
-	if err != nil {
-		return err
-	}
-
-	if len(buf) < 4 {
-		return errors.New("unexpected buffer length")
-	}
-
-	if buf[0] != vc.reqRespV {
-		return errors.New("unexpected response header")
-	}
-
-	if buf[2] != 0 {
-		return errors.New("dynamic port is not supported now")
-	}
-
-	return nil
 }
 
 func (c *ClientConn) Write(b []byte) (n int, err error) {
@@ -358,24 +293,30 @@ func (c *ClientConn) Write(b []byte) (n int, err error) {
 	}
 
 	if c.opt&OptChunkStream > 0 {
+		//Client to server derived key:
+		//cts:h(commonsecret|kdfSaltConstAEADKey|"Client"|uuid)
+		cts := utils.GetBytes(chacha20poly1305.KeySize)
+		defer utils.PutBytes(cts)
+		nonce := utils.GetBytes(chacha20poly1305.NonceSizeX)
+		defer utils.PutBytes(nonce)
+
+		h := sha3.NewShake256()
+		kdf(h, c.sharedsecret[:], cts, []byte(kdfSaltConstAEADKey), []byte("Client"), c.V2rayUser[:])
+
 		switch c.security {
 		case SecurityNone:
 			c.dataWriter = ChunkedWriter(c.dataWriter)
 
-		case SecurityAES128GCM:
-			block, _ := aes.NewCipher(c.reqBodyKey[:])
+		case SecurityAES256GCM:
+			block, _ := aes.NewCipher(cts)
 			aead, _ := cipher.NewGCM(block)
-			c.dataWriter = AEADWriter(c.dataWriter, aead, c.reqBodyIV[:], nil)
+			kdf(h, c.sharedsecret[:], nonce[:aead.NonceSize()], []byte(kdfSaltConstAEADIV), []byte("Client"), c.V2rayUser[:])
+			c.dataWriter = AEADWriter(c.dataWriter, aead, nonce[:aead.NonceSize()], nil)
 
 		case SecurityChacha20Poly1305:
-			key := utils.GetBytes(32)
-			t := md5.Sum(c.reqBodyKey[:])
-			copy(key, t[:])
-			t = md5.Sum(key[:16])
-			copy(key[16:], t[:])
-			aead, _ := chacha20poly1305.New(key)
-			c.dataWriter = AEADWriter(c.dataWriter, aead, c.reqBodyIV[:], nil)
-			utils.PutBytes(key)
+			kdf(h, c.sharedsecret[:], nonce, []byte(kdfSaltConstAEADIV), []byte("Client"), c.V2rayUser[:])
+			aead, _ := chacha20poly1305.NewX(cts)
+			c.dataWriter = AEADWriter(c.dataWriter, aead, nonce, nil)
 		}
 	}
 
@@ -383,14 +324,13 @@ func (c *ClientConn) Write(b []byte) (n int, err error) {
 		n, err = c.dataWriter.Write(b)
 		close(switchChan)
 		c.vmessout = nil
-
 		if err != nil {
-			return
+			return n, err
 		}
 		_, err = c.Conn.Write(outBuf.Bytes())
 	}
 
-	return
+	return n, err
 }
 
 func (c *ClientConn) Read(b []byte) (n int, err error) {
@@ -398,32 +338,30 @@ func (c *ClientConn) Read(b []byte) (n int, err error) {
 		return c.dataReader.Read(b)
 	}
 
-	err = c.aead_decodeRespHeader()
-
-	if err != nil {
-		return 0, err
-	}
-
 	c.dataReader = c.Conn
 	if c.opt&OptChunkStream > 0 {
+		stc := utils.GetBytes(chacha20poly1305.KeySize)
+		nonce := utils.GetBytes(chacha20poly1305.NonceSizeX)
+		defer utils.PutBytes(stc)
+		defer utils.PutBytes(nonce)
+
+		h := sha3.NewShake256()
+		kdf(h, c.sharedsecret[:], stc, []byte(kdfSaltConstAEADKey), []byte("Server"), c.V2rayUser[:])
+
 		switch c.security {
 		case SecurityNone:
 			c.dataReader = ChunkedReader(c.Conn)
 
-		case SecurityAES128GCM:
-			block, _ := aes.NewCipher(c.respBodyKey[:])
+		case SecurityAES256GCM:
+			block, _ := aes.NewCipher(stc)
 			aead, _ := cipher.NewGCM(block)
-			c.dataReader = AEADReader(c.Conn, aead, c.respBodyIV[:], nil)
+			kdf(h, c.sharedsecret[:], nonce[:aead.NonceSize()], []byte(kdfSaltConstAEADIV), []byte("Server"), c.V2rayUser[:])
+			c.dataReader = AEADReader(c.Conn, aead, nonce[:aead.NonceSize()], nil)
 
 		case SecurityChacha20Poly1305:
-			key := utils.GetBytes(32)
-			t := md5.Sum(c.respBodyKey[:])
-			copy(key, t[:])
-			t = md5.Sum(key[:16])
-			copy(key[16:], t[:])
-			aead, _ := chacha20poly1305.New(key)
-			c.dataReader = AEADReader(c.Conn, aead, c.respBodyIV[:], nil)
-			utils.PutBytes(key)
+			aead, _ := chacha20poly1305.NewX(stc)
+			kdf(h, c.sharedsecret[:], nonce, []byte(kdfSaltConstAEADIV), []byte("Server"), c.V2rayUser[:])
+			c.dataReader = AEADReader(c.Conn, aead, nonce, nil)
 		}
 	}
 

@@ -50,10 +50,6 @@ func (s *ShakeSizeParser) NextPaddingLen() uint16 {
 	return 0
 }
 
-//func (s *ShakeSizeParser) MaxPaddingLen() uint16 {
-//return 64
-//}
-
 type PaddingLengthGenerator interface {
 	MaxPaddingLen() uint16
 	NextPaddingLen() uint16

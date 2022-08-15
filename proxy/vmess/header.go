@@ -2,256 +2,133 @@ package vmess
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
-	"fmt"
-	"hash"
-	"hash/crc32"
 	"io"
-	"math"
-	"time"
 
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/sha3"
+
+	"github.com/cloudflare/circl/kem/kyber/kyber512"
 	"github.com/e1732a364fed/v2ray_simple/utils"
 )
 
 const (
-	kdfSaltConstAuthIDEncryptionKey             = "AES Auth ID Encryption"
-	kdfSaltConstAEADRespHeaderLenKey            = "AEAD Resp Header Len Key"
-	kdfSaltConstAEADRespHeaderLenIV             = "AEAD Resp Header Len IV"
-	kdfSaltConstAEADRespHeaderPayloadKey        = "AEAD Resp Header Key"
-	kdfSaltConstAEADRespHeaderPayloadIV         = "AEAD Resp Header IV"
-	kdfSaltConstVMessAEADKDF                    = "VMess AEAD KDF"
-	kdfSaltConstVMessHeaderPayloadAEADKey       = "VMess Header AEAD Key"
-	kdfSaltConstVMessHeaderPayloadAEADIV        = "VMess Header AEAD Nonce"
-	kdfSaltConstVMessHeaderPayloadLengthAEADKey = "VMess Header AEAD Key_Length"
-	kdfSaltConstVMessHeaderPayloadLengthAEADIV  = "VMess Header AEAD Nonce_Length"
+	kdfSaltConstAEADKey         = "AEAD kdfSaltConstKey"
+	kdfSaltConstAEADIV          = "AEAD kdfSaltConstIV"
+	kdfSaltConstAEADLengthNonce = "AEAD kdfSaltConstLengthNonce"
+	kdfSaltConstAEADLengthKey   = "AEAD kdfSaltConstLengthKey"
+	kdfSaltConstAEADHeaderNonce = "AEAD kdfSaltConstHeaderNonce"
+	kdfSaltConstAEADHeaderKey   = "AEAD kdfSaltConstHeaderKey"
+	kdfSaltConstAEADAuthID      = "AEAD kdfSaltConstAuthID"
 )
 
-const (
-	authid_len              = 16
-	authID_timeMaxSecondGap = 120
-)
+const authid_len = 16
 
-var ErrAuthID_timeBeyondGap = utils.ErrInErr{ErrDesc: fmt.Sprintf("vmess: time gap more than %d second", authID_timeMaxSecondGap), ErrDetail: utils.ErrInvalidData}
-
-func kdf(key []byte, path ...string) []byte {
-	hmacCreator := &hMacCreator{value: []byte(kdfSaltConstVMessAEADKDF)}
-	for _, v := range path {
-		hmacCreator = &hMacCreator{value: []byte(v), parent: hmacCreator}
-	}
-	hmacf := hmacCreator.Create()
-	hmacf.Write(key)
-	return hmacf.Sum(nil)
-}
-
-func kdf16(key []byte, path ...string) []byte {
-	r := kdf(key, path...)
-	return r[:16]
-}
-
-type hMacCreator struct {
-	parent *hMacCreator
-	value  []byte
-}
-
-func (h *hMacCreator) Create() hash.Hash {
-	if h.parent == nil {
-		return hmac.New(sha256.New, h.value)
-	}
-	return hmac.New(h.parent.Create, h.value)
-}
-
-//https://github.com/v2fly/v2fly-github-io/issues/20
-func createAuthID(cmdKey []byte, time int64) (result [authid_len]byte) {
-	buf := &bytes.Buffer{}
-	binary.Write(buf, binary.BigEndian, time)
-
-	random := make([]byte, 4)
-	rand.Read(random)
-	buf.Write(random)
-	zero := crc32.ChecksumIEEE(buf.Bytes())
-	binary.Write(buf, binary.BigEndian, zero)
-
-	aesBlock, _ := generateCipher(cmdKey)
-
-	aesBlock.Encrypt(result[:], buf.Bytes())
-	return result
-}
-
-func generateCipher(cmdKey []byte) (cipher.Block, error) {
-	return aes.NewCipher(kdf16(cmdKey, kdfSaltConstAuthIDEncryptionKey))
-}
-func generateCipherByV2rayUser(u utils.V2rayUser) (cipher.Block, error) {
-	return generateCipher(GetKey(u))
-}
-
-//为0表示匹配成功, 如果不为0，则匹配失败；若为1，则CRC 校验失败（正常地匹配失败，不意味着被攻击）; 若为2，则表明校验成功 但是 时间差距超过 authID_timeMaxSecondGap 秒，如果为3，则表明遇到了重放攻击。
-func tryMatchAuthIDByBlock(now int64, block cipher.Block, encrypted_authID [16]byte, anitReplayMachine *authid_antiReplayMachine) (failReason int) {
-
-	var t int64
-	//var rand int32
-	var zero uint32
-
+//为1表示匹配成功, 若为0，则hmac 校验失败（正常地匹配失败，不意味着被攻击）
+func tryMatchAuthID(Encap, ReceivedAuthID, u []byte) (failReason int) {
+	h := sha3.NewShake256()
 	data := utils.GetBytes(authid_len)
-	block.Decrypt(data, encrypted_authID[:])
-
-	buf := bytes.NewBuffer(data)
-
-	binary.Read(buf, binary.BigEndian, &t)
-	//binary.Read(buf, binary.BigEndian, &rand)
-
-	buf.Next(4)
-	binary.Read(buf, binary.BigEndian, &zero)
-
-	if zero != crc32.ChecksumIEEE(data[:12]) {
-		return 1
-	}
-
-	if math.Abs(math.Abs(float64(t))-float64(now)) > authID_timeMaxSecondGap {
-		return 2
-	}
-
-	if anitReplayMachine != nil {
-
-		if !anitReplayMachine.check(encrypted_authID) {
-			return 3
-		}
-	}
-
-	return 0
+	defer utils.PutBytes(data)
+	kdf(h, u, data, Encap, []byte(kdfSaltConstAEADAuthID), u)
+	return subtle.ConstantTimeCompare(data, ReceivedAuthID)
 }
 
-//key长度必须16位
-func sealAEADHeader(key []byte, data []byte, t time.Time) []byte {
-	generatedAuthID := createAuthID(key[:], t.Unix())
-	connectionNonce := make([]byte, 8)
-	rand.Read(connectionNonce)
-
-	aeadPayloadLengthSerializedByte := make([]byte, 2)
-	binary.BigEndian.PutUint16(aeadPayloadLengthSerializedByte, uint16(len(data)))
-
-	var payloadHeaderLengthAEADEncrypted []byte
-
-	{
-		payloadHeaderLengthAEADKey := kdf(key[:], kdfSaltConstVMessHeaderPayloadLengthAEADKey, string(generatedAuthID[:]), string(connectionNonce))[:16]
-		payloadHeaderLengthAEADNonce := kdf(key[:], kdfSaltConstVMessHeaderPayloadLengthAEADIV, string(generatedAuthID[:]), string(connectionNonce))[:12]
-		payloadHeaderLengthAEADAESBlock, _ := aes.NewCipher(payloadHeaderLengthAEADKey)
-		payloadHeaderAEAD, _ := cipher.NewGCM(payloadHeaderLengthAEADAESBlock)
-		payloadHeaderLengthAEADEncrypted = payloadHeaderAEAD.Seal(nil, payloadHeaderLengthAEADNonce, aeadPayloadLengthSerializedByte, generatedAuthID[:])
+func kdf(h sha3.ShakeHash, key, result []byte, info ...[]byte) {
+	h.Write(key)
+	for _, v := range info {
+		h.Write([]byte(v))
 	}
+	// envelop construction
+	h.Write(key)
+	h.Read(result)
+	h.Reset()
+}
 
-	var payloadHeaderAEADEncrypted []byte
+func sealAEADHeader(mastersecret, data []byte) []byte {
+	h := sha3.NewShake256()
+	key := utils.GetBytes(chacha20poly1305.KeySize)
+	defer utils.PutBytes(key)
+	nonce := utils.GetBytes(chacha20poly1305.NonceSizeX)
+	defer utils.PutBytes(nonce)
+	//length:=realHdrLen-Encap
+	length := make([]byte, 2)
+	binary.BigEndian.PutUint16(length, uint16(len(data)-kyber512.CiphertextSize)-authid_len)
+	kdf(h, mastersecret, key, []byte(kdfSaltConstAEADLengthKey))
+	lenAEAD, _ := chacha20poly1305.NewX(key)
 
-	{
-		payloadHeaderAEADKey := kdf(key[:], kdfSaltConstVMessHeaderPayloadAEADKey, string(generatedAuthID[:]), string(connectionNonce))[:16]
-		payloadHeaderAEADNonce := kdf(key[:], kdfSaltConstVMessHeaderPayloadAEADIV, string(generatedAuthID[:]), string(connectionNonce))[:12]
-		payloadHeaderAEADAESBlock, _ := aes.NewCipher(payloadHeaderAEADKey)
-		payloadHeaderAEAD, _ := cipher.NewGCM(payloadHeaderAEADAESBlock)
-		payloadHeaderAEADEncrypted = payloadHeaderAEAD.Seal(nil, payloadHeaderAEADNonce, data, generatedAuthID[:])
-	}
-
+	kdf(h, mastersecret, nonce, []byte(kdfSaltConstAEADLengthNonce))
+	lenEnc := lenAEAD.Seal(nil, nonce, length, nil)
 	outputBuffer := &bytes.Buffer{}
 
-	outputBuffer.Write(generatedAuthID[:])
-	outputBuffer.Write(payloadHeaderLengthAEADEncrypted)
-	outputBuffer.Write(connectionNonce)
-	outputBuffer.Write(payloadHeaderAEADEncrypted)
+	kdf(h, mastersecret, key, []byte(kdfSaltConstAEADHeaderKey))
+	hdrAEAD, _ := chacha20poly1305.NewX(key)
+	kdf(h, mastersecret, nonce, []byte(kdfSaltConstAEADHeaderNonce))
+	hdrEnc := hdrAEAD.Seal(nil, nonce, data[kyber512.CiphertextSize+authid_len:], nil)
 
+	outputBuffer.Write(data[:kyber512.CiphertextSize+authid_len])
+	outputBuffer.Write(lenEnc)
+	outputBuffer.Write(hdrEnc)
 	return outputBuffer.Bytes()
 }
 
-//from v2fly/v2ray-core/proxy/vmess/aead/encrypt.go/OpenVMessAEADHeader.
-// key 必须是16字节长. v2ray 的代码返回值没命名，不可取，我们加上。
-func openAEADHeader(key []byte, authid []byte, remainDataReader io.Reader) (aeadData []byte, shouldDrain bool, bytesRead int, errorReason error) {
+func openAEADHeader(mastersecret []byte, remainDataReader io.Reader) (aeadData []byte, bytesRead int, errorReason error) {
 
-	var payloadHeaderLengthAEADEncrypted [18]byte
-	var nonce [8]byte
-
-	authidCheckValueReadBytesCounts, err := io.ReadFull(remainDataReader, payloadHeaderLengthAEADEncrypted[:])
+	encLen := utils.GetBytes(chacha20poly1305.Overhead + 2)
+	defer utils.PutBytes(encLen)
+	authidCheckValueReadBytesCounts, err := io.ReadFull(remainDataReader, encLen[:])
 	bytesRead += authidCheckValueReadBytesCounts
 	if err != nil {
-		return nil, false, bytesRead, err
+		return nil, bytesRead, err
 	}
-	nonceReadBytesCounts, err := io.ReadFull(remainDataReader, nonce[:])
-	bytesRead += nonceReadBytesCounts
+
+	key := utils.GetBytes(chacha20poly1305.KeySize)
+	defer utils.PutBytes(key)
+	nonce := utils.GetBytes(chacha20poly1305.NonceSizeX)
+	defer utils.PutBytes(nonce)
+	h := sha3.NewShake256()
+	var decHdrLenRusult []byte
+	kdf(h, mastersecret, key, []byte(kdfSaltConstAEADLengthKey))
+	lenAEAD, err := chacha20poly1305.NewX(key)
 	if err != nil {
-
-		return nil, false, bytesRead, err
+		panic(err.Error())
 	}
+	kdf(h, mastersecret, nonce, []byte(kdfSaltConstAEADLengthNonce))
+	decHdrLen, erropenAEAD := lenAEAD.Open(nil, nonce, encLen[:], nil)
 
-	var decryptedAEADHeaderLengthPayloadResult []byte
-
-	{
-		payloadHeaderLengthAEADKey := kdf16(key[:], kdfSaltConstVMessHeaderPayloadLengthAEADKey, string(authid[:]), string(nonce[:]))
-
-		payloadHeaderLengthAEADNonce := kdf(key[:], kdfSaltConstVMessHeaderPayloadLengthAEADIV, string(authid[:]), string(nonce[:]))[:12]
-
-		payloadHeaderAEADAESBlock, err := aes.NewCipher(payloadHeaderLengthAEADKey)
-		if err != nil {
-			panic(err.Error())
-		}
-
-		payloadHeaderLengthAEAD, err := cipher.NewGCM(payloadHeaderAEADAESBlock)
-		if err != nil {
-			panic(err.Error())
-		}
-
-		decryptedAEADHeaderLengthPayload, erropenAEAD := payloadHeaderLengthAEAD.Open(nil, payloadHeaderLengthAEADNonce, payloadHeaderLengthAEADEncrypted[:], authid[:])
-
-		if erropenAEAD != nil {
-
-			return nil, true, bytesRead, erropenAEAD
-		}
-
-		decryptedAEADHeaderLengthPayloadResult = decryptedAEADHeaderLengthPayload
+	if erropenAEAD != nil {
+		return nil, bytesRead, erropenAEAD
 	}
+	decHdrLenRusult = decHdrLen
 
 	var length uint16
-	if err := binary.Read(bytes.NewReader(decryptedAEADHeaderLengthPayloadResult), binary.BigEndian, &length); err != nil {
+	if err := binary.Read(bytes.NewReader(decHdrLenRusult), binary.BigEndian, &length); err != nil {
 		panic(err)
 	}
 
-	var decryptedAEADHeaderPayloadR []byte
+	var decHdrRusult []byte
 
-	var payloadHeaderAEADEncryptedReadedBytesCounts int
+	var HdrEncReadedBytesCounts int
 	{
-		payloadHeaderAEADKey := kdf16(key[:], kdfSaltConstVMessHeaderPayloadAEADKey, string(authid[:]), string(nonce[:]))
+		kdf(h, mastersecret, key, []byte(kdfSaltConstAEADHeaderKey))
+		kdf(h, mastersecret, nonce, []byte(kdfSaltConstAEADHeaderNonce))
 
-		payloadHeaderAEADNonce := kdf(key[:], kdfSaltConstVMessHeaderPayloadAEADIV, string(authid[:]), string(nonce[:]))[:12]
+		encHdr := make([]byte, length+chacha20poly1305.Overhead)
 
-		// 16 == AEAD Tag size
-		payloadHeaderAEADEncrypted := make([]byte, length+16)
-
-		payloadHeaderAEADEncryptedReadedBytesCounts, err = io.ReadFull(remainDataReader, payloadHeaderAEADEncrypted)
-		bytesRead += payloadHeaderAEADEncryptedReadedBytesCounts
+		HdrEncReadedBytesCounts, err = io.ReadFull(remainDataReader, encHdr)
+		bytesRead += HdrEncReadedBytesCounts
 		if err != nil {
-
-			return nil, false, bytesRead, err
+			return nil, bytesRead, err
 		}
 
-		payloadHeaderAEADAESBlock, err := aes.NewCipher(payloadHeaderAEADKey)
-		if err != nil {
-			panic(err.Error())
-		}
-
-		payloadHeaderAEAD, err := cipher.NewGCM(payloadHeaderAEADAESBlock)
-		if err != nil {
-			panic(err.Error())
-		}
-
-		decryptedAEADHeaderPayload, erropenAEAD := payloadHeaderAEAD.Open(nil, payloadHeaderAEADNonce, payloadHeaderAEADEncrypted, authid[:])
-
+		hdrAEAD, _ := chacha20poly1305.NewX(key)
+		decHdr, erropenAEAD := hdrAEAD.Open(nil, nonce, encHdr, nil)
 		if erropenAEAD != nil {
-
-			return nil, true, bytesRead, erropenAEAD
+			return nil, bytesRead, erropenAEAD
 		}
 
-		decryptedAEADHeaderPayloadR = decryptedAEADHeaderPayload
+		decHdrRusult = decHdr
 	}
 
-	return decryptedAEADHeaderPayloadR, false, bytesRead, nil
+	return decHdrRusult, bytesRead, nil
 }

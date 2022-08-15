@@ -26,7 +26,7 @@ func AEADWriter(w io.Writer, aead cipher.AEAD, iv []byte, shakeParser *ShakeSize
 		Writer:      w,
 		AEAD:        aead,
 		buf:         utils.GetPacket(), //make([]byte, lenSize+chunkSize),
-		nonce:       make([]byte, aead.NonceSize()),
+		nonce:       make([]byte, len(iv)),
 		iv:          iv,
 		shakeParser: shakeParser,
 	}
@@ -50,7 +50,7 @@ func (w *aeadWriter) Write(b []byte) (n int, err error) {
 		encryptBuf := eb[sizeBytes : sizeBytes+encryptedSize]
 
 		binary.BigEndian.PutUint16(w.nonce[:2], w.count)
-		copy(w.nonce[2:], w.iv[2:12])
+		copy(w.nonce[2:], w.iv[2:])
 
 		w.Seal(encryptBuf[:0], w.nonce, b, nil)
 		w.count++
@@ -72,7 +72,7 @@ func (w *aeadWriter) Write(b []byte) (n int, err error) {
 		binary.BigEndian.PutUint16(buf[:lenSize], uint16(n+w.Overhead()))
 
 		binary.BigEndian.PutUint16(w.nonce[:2], w.count)
-		copy(w.nonce[2:], w.iv[2:12])
+		copy(w.nonce[2:], w.iv[2:])
 
 		w.Seal(payloadBuf[:0], w.nonce, b, nil)
 		w.count++
@@ -100,7 +100,7 @@ func AEADReader(r io.Reader, aead cipher.AEAD, iv []byte, shakeParser *ShakeSize
 		Reader:      r,
 		AEAD:        aead,
 		buf:         utils.GetPacket(),
-		nonce:       make([]byte, aead.NonceSize()),
+		nonce:       make([]byte, len(iv)),
 		iv:          iv,
 		shakeParser: shakeParser,
 	}
@@ -175,7 +175,7 @@ func (r *aeadReader) Read(b []byte) (int, error) {
 	}
 
 	binary.BigEndian.PutUint16(r.nonce[:2], r.count)
-	copy(r.nonce[2:], r.iv[2:12])
+	copy(r.nonce[2:], r.iv[2:])
 
 	returnedData, err := r.Open(buf[:0], r.nonce, buf, nil)
 	r.count++

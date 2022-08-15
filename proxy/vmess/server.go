@@ -4,56 +4,34 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/md5"
-	"crypto/sha256"
-	"encoding/binary"
+	"encoding/hex"
 	"errors"
-	"hash/fnv"
+
 	"io"
 	"net"
 	"net/url"
-	"time"
 
+	"github.com/cloudflare/circl/kem/kyber/kyber512"
 	"github.com/e1732a364fed/v2ray_simple/netLayer"
 	"github.com/e1732a364fed/v2ray_simple/proxy"
 	"github.com/e1732a364fed/v2ray_simple/utils"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/sha3"
 )
-
-var ErrReplayAttack = errors.New("vmess: we are under replay attack! ")
-
-var ErrReplaySessionAttack = utils.ErrInErr{ErrDesc: "duplicated session id, we are under replay attack! ", ErrDetail: ErrReplayAttack}
 
 func init() {
 	proxy.RegisterServer(Name, &ServerCreator{})
 }
 
-type pair struct {
-	utils.V2rayUser
-	cipher.Block
-}
-
-func authUserByAuthPairList(bs []byte, authPairList []pair, anitReplayMachine *authid_antiReplayMachine) (user utils.V2rayUser, err error) {
-	now := time.Now().Unix()
-
-	var encrypted_authid [authid_len]byte
-	copy(encrypted_authid[:], bs)
-
-	for _, p := range authPairList {
-		failreason := tryMatchAuthIDByBlock(now, p.Block, encrypted_authid, anitReplayMachine)
+func authUserByAuthList(encap, recAuthID []byte, authList []utils.V2rayUser) (user utils.V2rayUser, err error) {
+	for _, u := range authList {
+		failreason := tryMatchAuthID(encap, recAuthID, u[:])
 		switch failreason {
-
 		case 0:
-			return p.V2rayUser, nil
-		case 1:
 			err = utils.ErrInvalidData
-		case 2:
-			err = ErrAuthID_timeBeyondGap
-		case 3:
-			err = ErrReplayAttack
-			return
-
+		case 1:
+			return u, nil
 		}
 	}
 	if err == nil {
@@ -67,17 +45,7 @@ type ServerCreator struct{}
 
 func (ServerCreator) NewServerFromURL(url *url.URL) (proxy.Server, error) {
 
-	s := NewServer()
-
-	if uuidStr := url.User.Username(); uuidStr != "" {
-		v2rayUser, err := utils.NewV2rayUser(uuidStr)
-		if err != nil {
-			return nil, err
-		}
-		s.addUser(v2rayUser)
-	}
-
-	return s, nil
+	return nil, errors.New("public key too long to be put into url")
 }
 
 func (ServerCreator) NewServer(lc *proxy.ListenConf) (proxy.Server, error) {
@@ -86,17 +54,28 @@ func (ServerCreator) NewServer(lc *proxy.ListenConf) (proxy.Server, error) {
 	s := NewServer()
 
 	if uuidStr != "" {
-		v2rayUser, err := utils.NewV2rayUser(uuidStr)
+		vmessUser, err := utils.NewV2rayUser(uuidStr)
 		if err != nil {
 			return nil, err
 		}
-		s.addUser(v2rayUser)
+		s.addUser(vmessUser)
 	}
 
 	if len(lc.Users) > 0 {
 		us := utils.InitRealV2rayUsers(lc.Users)
 		for _, u := range us {
 			s.addUser(u)
+		}
+	}
+	if len(lc.Extra) > 0 {
+		if thing := lc.Extra["server_privatekey"]; thing != nil {
+			if str, ok := thing.(string); ok {
+				ds, err := hex.DecodeString(str)
+				if err != nil {
+					return nil, err
+				}
+				s.srvpri.Unpack(ds)
+			}
 		}
 	}
 	return s, nil
@@ -108,39 +87,27 @@ type Server struct {
 
 	*utils.MultiUserMap
 
-	authPairList []pair
-
-	authid_anitReplayMachine  *authid_antiReplayMachine
-	session_antiReplayMachine *session_antiReplayMachine
+	authList []utils.V2rayUser
+	srvpri   kyber512.PrivateKey
 }
 
 func NewServer() *Server {
 	s := &Server{
-		MultiUserMap:              utils.NewMultiUserMap(),
-		authid_anitReplayMachine:  newAuthIDAntiReplyMachine(),
-		session_antiReplayMachine: newSessionAntiReplayMachine(),
+		MultiUserMap: utils.NewMultiUserMap(),
 	}
 	s.SetUseUUIDStr_asKey()
 	return s
 }
 func (s *Server) Name() string { return Name }
 
-func (s *Server) Stop() {
-	s.authid_anitReplayMachine.stop()
-	s.session_antiReplayMachine.stop()
-}
-
 func (s *Server) addUser(u utils.V2rayUser) {
 	s.MultiUserMap.AddUser_nolock(u)
-	b, err := generateCipherByV2rayUser(u)
-	if err != nil {
-		panic(err)
-	}
-	p := pair{
-		V2rayUser: u,
-		Block:     b,
-	}
-	s.authPairList = append(s.authPairList, p)
+	s.authList = append(s.authList, u)
+}
+
+type ksession struct {
+	uid          utils.V2rayUser
+	mastersecret [kyber512.SharedKeySize]byte
 }
 
 func (s *Server) Handshake(underlay net.Conn) (tcpConn net.Conn, msgConn netLayer.MsgConn, targetAddr netLayer.Addr, returnErr error) {
@@ -151,80 +118,59 @@ func (s *Server) Handshake(underlay net.Conn) (tcpConn net.Conn, msgConn netLaye
 	defer netLayer.PersistConn(underlay)
 
 	data := utils.GetPacket()
+	defer utils.PutPacket(data)
 
 	n, err := underlay.Read(data)
 	if err != nil {
 		returnErr = err
 		return
-	} else if n < authid_len {
-		returnErr = utils.NumErr{E: utils.ErrInvalidData, N: 1}
+	} else if n < kyber512.CiphertextSize {
+		returnErr = utils.NumErr{E: errors.New("too little data"), N: 1}
 		return
 	}
-	user, err := authUserByAuthPairList(data[:authid_len], s.authPairList, s.authid_anitReplayMachine)
-	if err != nil {
 
+	var ks ksession
+
+	ks.uid, err = authUserByAuthList(data[:kyber512.CiphertextSize], data[kyber512.CiphertextSize:kyber512.CiphertextSize+authid_len], s.authList)
+	if err != nil {
 		returnErr = err
 		return
-
 	}
+	s.srvpri.DecapsulateTo(ks.mastersecret[:], data[:kyber512.CiphertextSize])
 
-	cmdKey := GetKey(user)
-	remainBuf := bytes.NewBuffer(data[authid_len:n])
+	remainBuf := bytes.NewBuffer(data[kyber512.CiphertextSize+authid_len : n])
 
-	aeadData, shouldDrain, bytesRead, errorReason := openAEADHeader(cmdKey, data[:16], remainBuf)
+	aeadData, bytesRead, errorReason := openAEADHeader(ks.mastersecret[:], remainBuf)
 	if errorReason != nil {
 		returnErr = errorReason
 
 		if ce := utils.CanLogWarn("vmess openAEADHeader err"); ce != nil {
-			//看v2ray有一个 "drain"的用法，
-			//然而，我们这里是不需要drain的，区别在于，v2ray 不是一次性读取一大串数据，
-			// 而是用一个 reader 一点一点读，这就会产生一些可探测的问题，所以才要drain
-			// 而我们直接用 64K 的大buf 一下子读取整个客户端发来的整个数据， 没有读取长度的差别。
 
-			//不过 为了尊重v2ray的代码，也 以防 我的想法有错误，还是把这个情况陈列在这里，留作备用。
-
-			ce.Write(zap.Any("things", []any{errorReason, shouldDrain, bytesRead}))
+			ce.Write(zap.Any("things", []any{errorReason, bytesRead}))
 		}
 
 		return
 	}
-	if len(aeadData) < 38 {
+	if len(aeadData) < 8 {
 		returnErr = utils.NumErr{E: utils.ErrInvalidData, N: 3}
 		return
 	}
 
 	//https://www.v2fly.org/developer/protocols/vmess.html#%E6%8C%87%E4%BB%A4%E9%83%A8%E5%88%86
 	sc := &ServerConn{
-		version:   int(aeadData[0]),
 		Conn:      underlay,
-		V2rayUser: user,
-		reqRespV:  aeadData[33],
-		opt:       aeadData[34],
-		security:  aeadData[35] & 0x0f,
-		cmd:       aeadData[37],
+		V2rayUser: ks.uid,
+		opt:       aeadData[0],
+		security:  aeadData[1],
+		cmd:       aeadData[3],
 	}
+	copy(sc.sharedsecret[:], ks.mastersecret[:])
 
-	copy(sc.reqBodyIV[:], aeadData[1:17])
-	copy(sc.reqBodyKey[:], aeadData[17:33])
-
-	paddingLen := int(aeadData[35] >> 4)
-
-	lenBefore := len(aeadData[38:])
-
-	aeadDataBuf := bytes.NewBuffer(aeadData[38:])
-
-	var sid sessionID
-	copy(sid.user[:], user.IdentityBytes())
-	sid.key = sc.reqBodyKey
-	sid.nonce = sc.reqBodyIV
-
-	if !s.session_antiReplayMachine.check(sid) {
-		returnErr = ErrReplaySessionAttack
-		return
-	}
+	paddingLen := int(aeadData[2])
+	aeadDataBuf := bytes.NewBuffer(aeadData[4:])
 
 	switch sc.cmd {
-	//我们 不支持vmess 的 mux.cool
+
 	case CmdTCP, CmdUDP:
 		ad, err := netLayer.V2rayGetAddrFrom(aeadDataBuf)
 		if err != nil {
@@ -245,25 +191,10 @@ func (s *Server) Handshake(underlay net.Conn) (tcpConn net.Conn, msgConn netLaye
 		}
 	}
 
-	lenAfter := aeadDataBuf.Len()
-	realLen := lenBefore - lenAfter + 38
-
-	fnv1a := fnv.New32a()
-	fnv1a.Write(aeadData[:realLen])
-	actualHash := fnv1a.Sum32()
-
-	expectedHash := binary.BigEndian.Uint32(aeadDataBuf.Next(4))
-
-	if actualHash != expectedHash {
-		returnErr = utils.NumErr{E: utils.ErrInvalidData, N: 6}
-		return
-	}
-
 	sc.remainReadBuf = remainBuf
 
 	buf := utils.GetBuf()
-
-	sc.aead_encodeRespHeader(buf)
+	defer utils.PutBuf(buf)
 	sc.firstWriteBuf = buf
 
 	if sc.cmd == CmdTCP {
@@ -280,61 +211,17 @@ type ServerConn struct {
 	net.Conn
 
 	utils.V2rayUser
-	version  int
 	opt      byte
 	security byte
 	cmd      byte
-	reqRespV byte
 
 	theTarget netLayer.Addr
 
-	reqBodyIV   [16]byte
-	reqBodyKey  [16]byte
-	respBodyIV  [16]byte
-	respBodyKey [16]byte
-
 	remainReadBuf, firstWriteBuf *bytes.Buffer
 
-	dataReader io.Reader
-	dataWriter io.Writer
-}
-
-func (s *ServerConn) aead_encodeRespHeader(outBuf *bytes.Buffer) error {
-	BodyKey := sha256.Sum256(s.reqBodyKey[:])
-	copy(s.respBodyKey[:], BodyKey[:16])
-	BodyIV := sha256.Sum256(s.reqBodyIV[:])
-	copy(s.respBodyIV[:], BodyIV[:16])
-
-	encryptionWriter := utils.GetBuf()
-	encryptionWriter.Write([]byte{s.reqRespV, 0})
-	encryptionWriter.Write([]byte{0x00, 0x00}) //我们暂时不支持动态端口，太复杂, 懒。
-
-	aeadResponseHeaderLengthEncryptionKey := kdf16(s.respBodyKey[:], kdfSaltConstAEADRespHeaderLenKey)
-	aeadResponseHeaderLengthEncryptionIV := kdf(s.respBodyIV[:], kdfSaltConstAEADRespHeaderLenIV)[:12]
-
-	aeadResponseHeaderLengthEncryptionKeyAESBlock, _ := aes.NewCipher(aeadResponseHeaderLengthEncryptionKey)
-	aeadResponseHeaderLengthEncryptionAEAD, _ := cipher.NewGCM(aeadResponseHeaderLengthEncryptionKeyAESBlock)
-
-	aeadResponseHeaderLengthEncryptionBuffer := bytes.NewBuffer(nil)
-
-	decryptedResponseHeaderLengthBinaryDeserializeBuffer := uint16(encryptionWriter.Len())
-
-	binary.Write(aeadResponseHeaderLengthEncryptionBuffer, binary.BigEndian, decryptedResponseHeaderLengthBinaryDeserializeBuffer)
-
-	AEADEncryptedLength := aeadResponseHeaderLengthEncryptionAEAD.Seal(nil, aeadResponseHeaderLengthEncryptionIV, aeadResponseHeaderLengthEncryptionBuffer.Bytes(), nil)
-	io.Copy(outBuf, bytes.NewReader(AEADEncryptedLength))
-
-	aeadResponseHeaderPayloadEncryptionKey := kdf16(s.respBodyKey[:], kdfSaltConstAEADRespHeaderPayloadKey)
-	aeadResponseHeaderPayloadEncryptionIV := kdf(s.respBodyIV[:], kdfSaltConstAEADRespHeaderPayloadIV)[:12]
-
-	aeadResponseHeaderPayloadEncryptionKeyAESBlock, _ := aes.NewCipher(aeadResponseHeaderPayloadEncryptionKey)
-	aeadResponseHeaderPayloadEncryptionAEAD, _ := cipher.NewGCM(aeadResponseHeaderPayloadEncryptionKeyAESBlock)
-
-	aeadEncryptedHeaderPayload := aeadResponseHeaderPayloadEncryptionAEAD.Seal(nil, aeadResponseHeaderPayloadEncryptionIV, encryptionWriter.Bytes(), nil)
-
-	io.Copy(outBuf, bytes.NewReader(aeadEncryptedHeaderPayload))
-	return nil
-
+	dataReader   io.Reader
+	dataWriter   io.Writer
+	sharedsecret [kyber512.SharedKeySize]byte
 }
 
 func (c *ServerConn) Write(b []byte) (n int, err error) {
@@ -354,55 +241,46 @@ func (c *ServerConn) Write(b []byte) (n int, err error) {
 
 	c.dataWriter = writer
 
-	var shakeParser *ShakeSizeParser
+	stc := utils.GetBytes(chacha20poly1305.KeySize)
+	nonce := utils.GetBytes(chacha20poly1305.NonceSizeX)
+	defer utils.PutBytes(stc)
+	defer utils.PutBytes(nonce)
 
-	if c.opt&OptChunkMasking == OptChunkMasking {
-
-		shouldPad := false
-		if c.opt&OptGlobalPadding == OptGlobalPadding {
-			shouldPad = true
-
-		}
-		shakeParser = NewShakeSizeParser(c.respBodyIV[:], shouldPad)
-	}
+	h := sha3.NewShake256()
+	kdf(h, c.sharedsecret[:], stc, []byte(kdfSaltConstAEADKey), []byte("Server"), c.V2rayUser[:])
 
 	if c.opt&OptChunkStream == OptChunkStream {
+
 		switch c.security {
 		case SecurityNone:
 			c.dataWriter = ChunkedWriter(writer)
-
-		case SecurityAES128GCM:
-			block, _ := aes.NewCipher(c.respBodyKey[:])
+		case SecurityAES256GCM:
+			block, _ := aes.NewCipher(stc)
 			aead, _ := cipher.NewGCM(block)
-			c.dataWriter = AEADWriter(writer, aead, c.respBodyIV[:], shakeParser)
+			kdf(h, c.sharedsecret[:], nonce[:aead.NonceSize()], []byte(kdfSaltConstAEADIV), []byte("Server"), c.V2rayUser[:])
+			c.dataWriter = AEADWriter(writer, aead, nonce[:aead.NonceSize()], nil)
 
 		case SecurityChacha20Poly1305:
-			key := utils.GetBytes(32)
-			t := md5.Sum(c.respBodyKey[:])
-			copy(key, t[:])
-			t = md5.Sum(key[:16])
-			copy(key[16:], t[:])
-			aead, _ := chacha20poly1305.New(key)
-			c.dataWriter = AEADWriter(writer, aead, c.respBodyIV[:], shakeParser)
-			utils.PutBytes(key)
+			aead, _ := chacha20poly1305.NewX(stc)
+			kdf(h, c.sharedsecret[:], nonce, []byte(kdfSaltConstAEADIV), []byte("Server"), c.V2rayUser[:])
+			c.dataWriter = AEADWriter(writer, aead, nonce, nil)
 		}
 	}
 
 	n, err = c.dataWriter.Write(b)
 
 	close(switchChan)
-
 	if err != nil {
-		return
+		return n, err
 	}
 	_, err = c.Conn.Write(c.firstWriteBuf.Bytes())
 	utils.PutBuf(c.firstWriteBuf)
 	c.firstWriteBuf = nil
-	return
+	return n, err
+
 }
 
 func (c *ServerConn) Read(b []byte) (n int, err error) {
-
 	if c.dataReader != nil {
 		return c.dataReader.Read(b)
 	}
@@ -411,43 +289,33 @@ func (c *ServerConn) Read(b []byte) (n int, err error) {
 		curReader = io.MultiReader(c.remainReadBuf, c.Conn)
 	} else {
 		curReader = c.Conn
-
 	}
-	var shakeParser *ShakeSizeParser
 
-	if c.opt&OptChunkMasking > 0 {
+	cts := utils.GetBytes(chacha20poly1305.KeySize)
+	nonce := utils.GetBytes(chacha20poly1305.NonceSizeX)
+	defer utils.PutBytes(cts)
+	defer utils.PutBytes(nonce)
 
-		shouldPad := false
-
-		if c.opt&OptGlobalPadding > 0 {
-			shouldPad = true
-
-		}
-
-		shakeParser = NewShakeSizeParser(c.reqBodyIV[:], shouldPad)
-	}
+	h := sha3.NewShake256()
+	kdf(h, c.sharedsecret[:], cts, []byte(kdfSaltConstAEADKey), []byte("Client"), c.V2rayUser[:])
 
 	if c.opt&OptChunkStream > 0 {
 		switch c.security {
 		case SecurityNone:
 			c.dataReader = ChunkedReader(curReader)
 
-		case SecurityAES128GCM:
-
-			block, _ := aes.NewCipher(c.reqBodyKey[:])
+		case SecurityAES256GCM:
+			block, _ := aes.NewCipher(cts)
 			aead, _ := cipher.NewGCM(block)
-			c.dataReader = AEADReader(curReader, aead, c.reqBodyIV[:], shakeParser)
+			kdf(h, c.sharedsecret[:], nonce[:aead.NonceSize()], []byte(kdfSaltConstAEADIV), []byte("Client"), c.V2rayUser[:])
+			c.dataReader = AEADReader(curReader, aead, nonce[:aead.NonceSize()], nil)
 
 		case SecurityChacha20Poly1305:
-			key := utils.GetBytes(32)
-			t := md5.Sum(c.reqBodyKey[:])
-			copy(key, t[:])
-			t = md5.Sum(key[:16])
-			copy(key[16:], t[:])
-			aead, _ := chacha20poly1305.New(key)
-			c.dataReader = AEADReader(curReader, aead, c.reqBodyIV[:], shakeParser)
-			utils.PutBytes(key)
+			aead, _ := chacha20poly1305.NewX(cts)
+			kdf(h, c.sharedsecret[:], nonce, []byte(kdfSaltConstAEADIV), []byte("Client"), c.V2rayUser[:])
+			c.dataReader = AEADReader(curReader, aead, nonce, nil)
 		}
+
 	}
 
 	return c.dataReader.Read(b)
